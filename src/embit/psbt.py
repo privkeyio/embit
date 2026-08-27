@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from .transaction import Transaction, TransactionOutput, TransactionInput, SIGHASH
+from .transaction import Transaction, TransactionOutput, TransactionInput, SIGHASH, UNIFIED_SCRIPT_TYPE
 from . import compact
 from . import bip32
 from . import ec
@@ -664,6 +664,9 @@ class PSBT(EmbitBase):
     def sighash_taproot(self, *args, **kwargs):
         return self.tx.sighash_taproot(*args, **kwargs)
 
+    def sighash_unified(self, *args, **kwargs):
+        return self.tx.sighash_unified(*args, **kwargs)
+
     @property
     def is_verified(self):
         return all([inp.is_verified for inp in self.inputs])
@@ -827,6 +830,76 @@ class PSBT(EmbitBase):
     def sighash(self, i, sighash=SIGHASH.ALL, **kwargs):
         inp = self.inputs[i]
 
+        # The unified algorithm covers every script type, so it is selected by
+        # the opt-in bit rather than by the input's kind. The kind only decides
+        # which script type byte and tail the message carries.
+        if sighash & SIGHASH.UNIFIED:
+            # Under ANYONECANPAY the message carries only this input's spent
+            # output, so do not demand the siblings: requiring them would reject
+            # PSBTs the algorithm does not need, and reading them through
+            # InputScope.utxo returns None rather than raising, which surfaces as
+            # an AttributeError inside a signer instead of a PSBTError.
+            if sighash & SIGHASH.ANYONECANPAY:
+                values = [0] * len(self.inputs)
+                scripts = [Script(b"")] * len(self.inputs)
+                values[i] = self.utxo(i).value
+                scripts[i] = self.utxo(i).script_pubkey
+            else:
+                values = [self.utxo(n).value for n in range(len(self.inputs))]
+                scripts = [
+                    self.utxo(n).script_pubkey for n in range(len(self.inputs))
+                ]
+            # BIP341's script-path arguments name a tapscript spend. Translate
+            # them rather than forwarding them: sighash_unified takes the leaf
+            # hash itself, and passing them through raises TypeError, which is
+            # how a crafted PSBT reached an unhandled error in callers.
+            leaf_script = kwargs.pop("script", None)
+            leaf_version = kwargs.pop("leaf_version", 0xC0)
+            kwargs.pop("ext_flag", None)
+            if inp.is_taproot:
+                if leaf_script is not None:
+                    return self.sighash_unified(
+                        i,
+                        UNIFIED_SCRIPT_TYPE.TAPSCRIPT,
+                        scripts,
+                        values,
+                        sighash,
+                        tapleaf_hash=hashes.tagged_hash(
+                            "TapLeaf", bytes([leaf_version]) + leaf_script.serialize()
+                        ),
+                        **kwargs,
+                    )
+                return self.sighash_unified(
+                    i,
+                    UNIFIED_SCRIPT_TYPE.TAPROOT,
+                    scripts,
+                    values,
+                    sighash,
+                    **kwargs,
+                )
+            sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+            is_segwit = (
+                inp.witness_script
+                or inp.witness_utxo
+                or inp.utxo.script_pubkey.script_type() in {"p2wpkh", "p2wsh"}
+                or (
+                    inp.redeem_script
+                    and inp.redeem_script.script_type() in {"p2wpkh", "p2wsh"}
+                )
+            )
+            # BIP143's implied P2PKH script, same substitution as segwit v0.
+            if sc.script_type() == "p2wpkh":
+                sc = script.p2pkh_from_p2wpkh(sc)
+            return self.sighash_unified(
+                i,
+                UNIFIED_SCRIPT_TYPE.WITNESS_V0 if is_segwit else UNIFIED_SCRIPT_TYPE.BARE,
+                scripts,
+                values,
+                sighash,
+                script_code=sc,
+                **kwargs,
+            )
+
         if inp.is_taproot:
             values = [inp.utxo.value for inp in self.inputs]
             scripts = [inp.utxo.script_pubkey for inp in self.inputs]
@@ -969,12 +1042,44 @@ class PSBT(EmbitBase):
             # if input sighash is set and is different from required sighash
             # we don't sign this input
             # except DEFAULT is functionally the same as ALL
+            #
+            # The unified opt-in is compared separately. It selects an algorithm
+            # rather than what the signature covers, so it is the caller's to
+            # decide: comparing the rest of the byte lets a caller opt in over a
+            # PSBT that declares plain ALL, which is what every wallet predating
+            # the fork writes. Without this the caller's request is dropped and
+            # the signature carries no replay protection.
             if required_sighash is not None and inp_sighash != required_sighash:
-                if inp_sighash not in {
+                if (inp_sighash & ~SIGHASH.UNIFIED) not in {
                     SIGHASH.DEFAULT,
                     SIGHASH.ALL,
-                } or required_sighash not in {SIGHASH.DEFAULT, SIGHASH.ALL}:
+                } or (required_sighash & ~SIGHASH.UNIFIED) not in {
+                    SIGHASH.DEFAULT,
+                    SIGHASH.ALL,
+                }:
                     continue
+                # A caller that names a hash type owns the opt-in bit in both
+                # directions, so the PSBT cannot choose the algorithm on its
+                # behalf. An untouched default names nothing, and stripping the
+                # bit there would turn a PSBT that asked for replay protection
+                # into a legacy signature while reporting success. Opting in
+                # only widens what the signature commits to, so honouring the
+                # request is never the unsafe direction; pass SIGHASH.ALL to
+                # refuse it, or sighash=None to defer for every other field too.
+                if sighash != SIGHASH.DEFAULT:
+                    inp_sighash = (inp_sighash & ~SIGHASH.UNIFIED) | (
+                        required_sighash & SIGHASH.UNIFIED
+                    )
+            # An opted-in taproot signature must name an output type: the bit
+            # cannot ride on SIGHASH_DEFAULT, which appends no byte to hold it.
+            # Bare and segwit v0 read the byte the legacy way, where 0x20 is a
+            # valid hash type carrying a message of its own, so it stays as it is.
+            if (
+                inp.is_taproot
+                and inp_sighash & SIGHASH.UNIFIED
+                and not inp_sighash & 0x1F
+            ):
+                inp_sighash |= SIGHASH.ALL
 
             # get all possible derivations with matching fingerprint
             bip32_derivations = set()
@@ -1010,11 +1115,13 @@ class PSBT(EmbitBase):
                     raise PSBTError("Derivation path doesn't look right")
                 derived_keypairs.add((hdkey.key, pub))
 
+            added = 0
+
             # sign with taproot key
             if inp.is_taproot:
                 # try to sign with individual private key (WIF)
                 # or with root without derivations
-                counter += self.sign_input_with_tapkey(
+                added += self.sign_input_with_tapkey(
                     root,
                     i,
                     inp,
@@ -1022,12 +1129,14 @@ class PSBT(EmbitBase):
                 )
                 # sign with all derived keys
                 for prv, pub in derived_keypairs:
-                    counter += self.sign_input_with_tapkey(
+                    added += self.sign_input_with_tapkey(
                         prv,
                         i,
                         inp,
                         sighash=inp_sighash,
                     )
+                counter += added
+                self._record_sighash_type(inp, inp_sighash, added)
                 continue
 
             # hash can be reused
@@ -1039,11 +1148,27 @@ class PSBT(EmbitBase):
                 sig = root.sign(h)
                 # sig plus sighash flag
                 inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
-                counter += 1
+                added += 1
 
             for prv, pub in derived_keypairs:
                 sig = prv.sign(h)
                 # sig plus sighash flag
                 inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
-                counter += 1
+                added += 1
+
+            counter += added
+            self._record_sighash_type(inp, inp_sighash, added)
         return counter
+
+    @staticmethod
+    def _record_sighash_type(inp, inp_sighash, added):
+        """Declare the hash type the signature just made actually uses.
+
+        Only the call that produced a signature does this: a finalizer or an
+        update pass holds no key, and rewriting a type it did not sign for would
+        lock out a co-signer that declared something else. Confined to the
+        opt-in, so signing that does not involve it leaves the field exactly as
+        it found it.
+        """
+        if added and inp_sighash & SIGHASH.UNIFIED:
+            inp.sighash_type = inp_sighash
