@@ -207,7 +207,7 @@ class PSBTView:
         self._hash_outputs = None
         self._hash_amounts = None
         self._hash_script_pubkeys = None
-        self._spent_outputs_cache = None
+        self._spent_output_hashes_cache = None
 
     @classmethod
     def view(cls, stream, offset=None, compress=CompressMode.KEEP_ALL):
@@ -596,27 +596,21 @@ class PSBTView:
         h.update(sighash.to_bytes(4, "little"))
         return hashlib.sha256(h.digest()).digest()
 
-    def _spent_outputs(self, i, anyonecanpay, scope=None):
-        """Values and scriptPubKeys of every spent output, in input order.
+    def _spent_output_hashes(self, i, scope=None):
+        """The two aggregates the message commits to: sha256 over every spent output's
+        amount, and over every spent output's scriptPubKey.
 
-        Under ANYONECANPAY the message carries only this input's spent output,
-        so the siblings are not read: requiring them would reject PSBTs the
-        algorithm does not need, and this class exists for signers that cannot
-        hold the whole transaction at once.
+        Neither depends on which input is being signed, so one pass over the stream
+        answers for the whole transaction. They are accumulated as the outputs are read
+        and the outputs themselves are not kept, which is the point: this class exists
+        so a signer never has to hold the whole transaction at once, and keeping one
+        spent output per input to build these would give that up for a large PSBT.
         """
-        if anyonecanpay:
-            values = [0] * self.num_inputs
-            scripts = [Script(b"")] * self.num_inputs
-            utxo = self._scoped_utxo(i, scope)
-            values[i] = utxo.value
-            scripts[i] = utxo.script_pubkey
-            return values, scripts
-
         # A value supplied out of band applies to the input being signed and to nothing
-        # else, so where the stream carries a different one for it the siblings below are
-        # still the stream's, and the signatures this view hands back would commit to two
-        # different spent output vectors. At most one of them can verify and nothing tells
-        # the caller which, so refuse rather than produce them.
+        # else, so where the stream carries a different one for it the siblings would
+        # still be the stream's, and the signatures this view hands back would commit to
+        # two different spent output vectors. At most one of them can verify and nothing
+        # tells the caller which, so refuse rather than produce them.
         if scope is not None and self.num_inputs > 1:
             supplied = self._scoped_utxo(i, scope)
             carried = self.input(i).utxo
@@ -624,37 +618,44 @@ class PSBTView:
                 raise PSBTError(
                     "Input %d was supplied a previous utxo the PSBT contradicts" % i
                 )
+            # Past that check the supplied output either equals the stream's or is the
+            # only one for that input, so it is the stream that decides the rest.
+            if carried is not None:
+                scope = None
 
-        # Reading every sibling is O(n) scope skips per input, so signing the whole
-        # transaction walks it O(n^2) times without this. The scopes do not change while
-        # the view is open, and clear_cache drops this with the other digests.
-        # The cache holds only what the stream itself carries. A scope supplied out of
-        # band belongs to one call and one input, so caching it would hand the caller's
-        # value to every later input as a sibling amount, and those signatures would
-        # commit to a value the PSBT does not contain. The scoped input is taken from the
-        # scope directly and never consults the cache, in either direction.
-        # This retains one TransactionOutput per input, on the order of a few hundred
-        # bytes each, until clear_cache is called. The digest needs every spent output;
-        # re-reading them per input instead would keep this class's usual constant
-        # footprint at the cost of walking the stream n times. ANYONECANPAY never builds it.
-        utxos = [
-            self._scoped_utxo(i, scope)
-            if (scope is not None and idx == i)
-            else self._stream_utxo(idx)
-            for idx in range(self.num_inputs)
-        ]
-        return [u.value for u in utxos], [u.script_pubkey for u in utxos]
+        if scope is None and self._spent_output_hashes_cache is not None:
+            return self._spent_output_hashes_cache
+
+        amounts = hashlib.sha256()
+        script_pubkeys = hashlib.sha256()
+        for idx in range(self.num_inputs):
+            utxo = (
+                self._scoped_utxo(idx, scope)
+                if (scope is not None and idx == i)
+                else self._stream_utxo(idx)
+            )
+            amounts.update(utxo.value.to_bytes(8, "little"))
+            script_pubkeys.update(utxo.script_pubkey.serialize())
+        pair = (amounts.digest(), script_pubkeys.digest())
+
+        # Only what the stream itself carries is cached. A scope supplied out of band
+        # belongs to one call and one input, so caching its answer would hand the
+        # caller's value to every later input as a sibling amount.
+        if scope is None:
+            self._spent_output_hashes_cache = pair
+        return pair
 
     def _stream_utxo(self, idx):
-        """The spent output of one input as the stream carries it, cached per index."""
-        if self._spent_outputs_cache is None:
-            self._spent_outputs_cache = {}
-        if idx not in self._spent_outputs_cache:
-            utxo = self.input(idx).utxo
-            if utxo is None:
-                raise PSBTError("Missing previous utxo on input %d" % idx)
-            self._spent_outputs_cache[idx] = utxo
-        return self._spent_outputs_cache[idx]
+        """The spent output of one input as the stream carries it.
+
+        Deliberately not memoized: the caller folds it into a running hash and drops
+        it, and the aggregate cache already saves the repeated pass that memoizing
+        these was for.
+        """
+        utxo = self.input(idx).utxo
+        if utxo is None:
+            raise PSBTError("Missing previous utxo on input %d" % idx)
+        return utxo
 
     def _scoped_utxo(self, idx, scope=None):
         """The spent output of the input being signed, preferring a scope supplied
@@ -689,6 +690,45 @@ class PSBTView:
             raise PSBTError("script_code is required for this script type")
         if script_type == 3 and tapleaf_hash is None:
             raise PSBTError("tapleaf_hash is required for tapscript")
+        _, anyonecanpay = SIGHASH.check_unified(sighash, script_type)
+        return self._unified_digest(
+            input_index,
+            script_type,
+            sighash,
+            own=(values[input_index], script_pubkeys[input_index])
+            if anyonecanpay
+            else None,
+            aggregates=None
+            if anyonecanpay
+            else (
+                self.hash_amounts(values),
+                self.hash_script_pubkeys(script_pubkeys),
+            ),
+            script_code=script_code,
+            annex=annex,
+            tapleaf_hash=tapleaf_hash,
+            codeseparator_pos=codeseparator_pos,
+        )
+
+    def _unified_digest(
+        self,
+        input_index,
+        script_type,
+        sighash,
+        aggregates=None,
+        own=None,
+        script_code=None,
+        annex=None,
+        tapleaf_hash=None,
+        codeseparator_pos=None,
+    ):
+        """The message itself, over what it actually commits to.
+
+        Without ANYONECANPAY that is the two aggregates over every spent output, which
+        do not depend on the input being signed. With it, only this input's own spent
+        output. Taking those rather than the full lists is what lets the streaming
+        caller build the digest without holding every spent output at once.
+        """
         sh, anyonecanpay = SIGHASH.check_unified(sighash, script_type)
 
         h = hashes.tagged_hash_init("UnifiedSighash", b"")
@@ -708,8 +748,8 @@ class PSBTView:
         h.update(b"\x00")
         if not anyonecanpay:
             h.update(self.hash_prevouts())
-            h.update(self.hash_amounts(values))
-            h.update(self.hash_script_pubkeys(script_pubkeys))
+            h.update(aggregates[0])
+            h.update(aggregates[1])
             h.update(self.hash_sequence())
         if sh not in (SIGHASH.NONE, SIGHASH.SINGLE):
             # ALL, and every value that is neither NONE nor SINGLE.
@@ -721,8 +761,8 @@ class PSBTView:
             inp = self.vin(input_index)
             h.update(bytes(reversed(inp.txid)))
             h.update(inp.vout.to_bytes(4, "little"))
-            h.update(values[input_index].to_bytes(8, "little"))
-            h.update(script_pubkeys[input_index].serialize())
+            h.update(own[0].to_bytes(8, "little"))
+            h.update(own[1].serialize())
             h.update(inp.sequence.to_bytes(4, "little"))
         else:
             h.update(input_index.to_bytes(4, "little"))
@@ -757,27 +797,31 @@ class PSBTView:
         # the opt-in bit rather than by the input's kind. Kept in step with
         # PSBT.sighash; a signer must not get a different digest here.
         if sighash & SIGHASH.UNIFIED:
-            values, scripts = self._spent_outputs(
-                i, sighash & SIGHASH.ANYONECANPAY, input_scope
-            )
+            # Only what the message commits to is read, and under ANYONECANPAY that is
+            # this input's spent output alone: requiring the siblings there would reject
+            # PSBTs the algorithm does not need them for.
+            if sighash & SIGHASH.ANYONECANPAY:
+                utxo = self._scoped_utxo(i, input_scope)
+                spent = {"own": (utxo.value, utxo.script_pubkey)}
+            else:
+                spent = {"aggregates": self._spent_output_hashes(i, input_scope)}
             leaf_script = kwargs.pop("script", None)
             leaf_version = kwargs.pop("leaf_version", 0xC0)
             kwargs.pop("ext_flag", None)
             if inp.is_taproot:
                 if leaf_script is not None:
-                    return self.sighash_unified(
+                    return self._unified_digest(
                         i,
                         UNIFIED_SCRIPT_TYPE.TAPSCRIPT,
-                        scripts,
-                        values,
                         sighash,
                         tapleaf_hash=hashes.tagged_hash(
                             "TapLeaf", bytes([leaf_version]) + leaf_script.serialize()
                         ),
+                        **spent,
                         **kwargs,
                     )
-                return self.sighash_unified(
-                    i, UNIFIED_SCRIPT_TYPE.TAPROOT, scripts, values, sighash, **kwargs
+                return self._unified_digest(
+                    i, UNIFIED_SCRIPT_TYPE.TAPROOT, sighash, **spent, **kwargs
                 )
             sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
             is_segwit = (
@@ -791,13 +835,12 @@ class PSBTView:
             )
             if sc.script_type() == "p2wpkh":
                 sc = script.p2pkh_from_p2wpkh(sc)
-            return self.sighash_unified(
+            return self._unified_digest(
                 i,
                 UNIFIED_SCRIPT_TYPE.WITNESS_V0 if is_segwit else UNIFIED_SCRIPT_TYPE.BARE,
-                scripts,
-                values,
                 sighash,
                 script_code=sc,
+                **spent,
                 **kwargs,
             )
 

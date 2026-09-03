@@ -427,6 +427,59 @@ class TestStreamingReaderCache(TestCase):
             1,
         )
 
+    def test_a_supplied_value_is_not_cached_for_later_inputs(self):
+        """A value supplied for one input is not the stream's. Caching the aggregate
+        it produced would let a later input borrow it, so whether that input can be
+        signed at all would depend on which one was signed first."""
+        psbt = build([UNIFIED_ALL, UNIFIED_ALL], values=[100000, 200000])
+        pub, spk, _ = _wallet("segwit")
+        psbt.inputs[0].witness_utxo = None
+        raw = psbt.serialize()
+        supplied = InputScope()
+        supplied.witness_utxo = TransactionOutput(100000, spk)
+
+        view = PSBTView.view(io.BytesIO(raw), compress=False)
+        view.sighash(0, sighash=UNIFIED_ALL, input_scope=supplied)
+        # input 0 is still missing as far as the PSBT is concerned
+        self.assertRaises(PSBTError, view.sighash, 1, sighash=UNIFIED_ALL)
+
+        # and the order the caller happened to use does not change that
+        fresh = PSBTView.view(io.BytesIO(raw), compress=False)
+        self.assertRaises(PSBTError, fresh.sighash, 1, sighash=UNIFIED_ALL)
+
+    def test_a_missing_sibling_is_reported_not_dereferenced(self):
+        """The digest needs every spent output. One the PSBT does not carry is a
+        PSBTError naming the input, not an AttributeError from inside the digest."""
+        psbt = build([UNIFIED_ALL, UNIFIED_ALL])
+        psbt.inputs[1].witness_utxo = None
+        view = PSBTView.view(io.BytesIO(psbt.serialize()), compress=False)
+        with self.assertRaises(PSBTError) as caught:
+            view.sighash(0, sighash=UNIFIED_ALL)
+        self.assertIn("input 1", str(caught.exception))
+
+    def test_what_is_kept_does_not_grow_with_the_transaction(self):
+        """The reason this class exists. The digest commits to every spent output, but
+        only the two aggregates over them are kept, so a signer that cannot hold the
+        whole transaction still does not have to."""
+        kept = []
+        for n in (2, 40, 200):
+            raw = build([UNIFIED_ALL] * n, nout=1).serialize()
+            view = PSBTView.view(io.BytesIO(raw), compress=False)
+            view.sighash(0, sighash=UNIFIED_ALL)
+            cache = view._spent_output_hashes_cache
+            self.assertEqual(len(cache), 2, n)
+            kept.append(sum(len(x) for x in cache))
+        self.assertEqual(kept, [64, 64, 64])
+
+    def test_anyonecanpay_keeps_nothing_and_reads_no_sibling(self):
+        """It commits to this input's spent output alone, so requiring the siblings
+        would refuse PSBTs the algorithm does not need them for."""
+        psbt = build([UNIFIED_ALL | ACP, UNIFIED_ALL | ACP], values=[100000, 200000])
+        psbt.inputs[1].witness_utxo = None
+        view = PSBTView.view(io.BytesIO(psbt.serialize()), compress=False)
+        self.assertEqual(view.sign_input(0, ROOT, io.BytesIO(), sighash=UNIFIED_ALL | ACP), 1)
+        self.assertIsNone(view._spent_output_hashes_cache)
+
     def test_caching_does_not_change_any_digest(self):
         """Signing several inputs on one view must equal a fresh view per input."""
         for kind in ("segwit", "taproot"):
