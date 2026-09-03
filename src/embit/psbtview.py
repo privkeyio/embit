@@ -434,15 +434,21 @@ class PSBTView:
             self._hash_outputs = h.digest()
         return self._hash_outputs
 
+    # The memo is keyed on what it was computed over. It used to be keyed on nothing,
+    # which was safe only while every caller passed the same list: a signer supplying one
+    # input's utxo out of band changes the list, and the first call's digest would then be
+    # returned for every later one, silently discarding what the caller supplied.
     def hash_amounts(self, amounts):
-        if self._hash_amounts is None:
-            self._hash_amounts = hash_amounts(amounts)
-        return self._hash_amounts
+        key = tuple(amounts)
+        if self._hash_amounts is None or self._hash_amounts[0] != key:
+            self._hash_amounts = (key, hash_amounts(amounts))
+        return self._hash_amounts[1]
 
     def hash_script_pubkeys(self, script_pubkeys):
-        if self._hash_script_pubkeys is None:
-            self._hash_script_pubkeys = hash_script_pubkeys(script_pubkeys)
-        return self._hash_script_pubkeys
+        key = tuple(bytes(s.data) for s in script_pubkeys)
+        if self._hash_script_pubkeys is None or self._hash_script_pubkeys[0] != key:
+            self._hash_script_pubkeys = (key, hash_script_pubkeys(script_pubkeys))
+        return self._hash_script_pubkeys[1]
 
     def sighash_taproot(
         self,
@@ -601,27 +607,42 @@ class PSBTView:
         if anyonecanpay:
             values = [0] * self.num_inputs
             scripts = [Script(b"")] * self.num_inputs
-            utxo = self._utxo(i, i, scope)
+            utxo = self._scoped_utxo(i, scope)
             values[i] = utxo.value
             scripts[i] = utxo.script_pubkey
             return values, scripts
 
         # Reading every sibling is O(n) scope skips per input, so signing the whole
-        # transaction walks it O(n^2) times without this. The scopes do not change while
-        # the view is open, and clear_cache drops this with the other digests.
-        if self._spent_outputs_cache is None:
-            self._spent_outputs_cache = [
-                self._utxo(idx, i, scope) for idx in range(self.num_inputs)
-            ]
-        utxos = list(self._spent_outputs_cache)
-        # The caller may have supplied this input's scope out of band
-        utxos[i] = self._utxo(i, i, scope)
+        # transaction walks it O(n^2) times without this.
+        #
+        # The cache holds only what the stream itself carries. A scope supplied out of
+        # band belongs to one call and one input, so caching it would hand the caller's
+        # value to every later input as a sibling amount, and those signatures would
+        # commit to a value the PSBT does not contain. The scoped input is taken from the
+        # scope directly and never consults the cache, in either direction.
+        utxos = [
+            self._scoped_utxo(i, scope)
+            if (scope is not None and idx == i)
+            else self._stream_utxo(idx)
+            for idx in range(self.num_inputs)
+        ]
         return [u.value for u in utxos], [u.script_pubkey for u in utxos]
 
-    def _utxo(self, idx, signing_index, scope=None):
-        """The spent output of one input, taking a scope supplied out of band for it."""
-        inp = scope if (scope is not None and idx == signing_index) else self.input(idx)
-        utxo = inp.utxo
+    def _stream_utxo(self, idx):
+        """The spent output of one input as the stream carries it, cached per index."""
+        if self._spent_outputs_cache is None:
+            self._spent_outputs_cache = {}
+        if idx not in self._spent_outputs_cache:
+            utxo = self.input(idx).utxo
+            if utxo is None:
+                raise PSBTError("Missing previous utxo on input %d" % idx)
+            self._spent_outputs_cache[idx] = utxo
+        return self._spent_outputs_cache[idx]
+
+    def _scoped_utxo(self, idx, scope=None):
+        """The spent output of the input being signed, preferring a scope supplied
+        out of band for it."""
+        utxo = (scope if scope is not None else self.input(idx)).utxo
         if utxo is None:
             raise PSBTError("Missing previous utxo on input %d" % idx)
         return utxo
@@ -923,6 +944,13 @@ class PSBTView:
         if inp.is_taproot and inp_sighash & SIGHASH.UNIFIED and not inp_sighash & 0x1F:
             inp_sighash |= SIGHASH.ALL
 
+        # SIGHASH_SINGLE commits to the output at this input's index, and there is none.
+        # The digest cannot be built, so this input is skipped rather than raising, as in
+        # PSBT.sign_with. Checked rather than caught, so it covers taproot too and cannot
+        # swallow an unrelated error.
+        if (inp_sighash & 0x1F) == SIGHASH.SINGLE and i >= self.num_outputs:
+            return 0
+
         # get all possible derivations with matching fingerprint
         bip32_derivations = set()
         if fingerprint:
@@ -985,12 +1013,7 @@ class PSBTView:
                 ser_string(sig_stream, inp.taproot_sigs[(pub, leaf)])
             return counter
 
-        try:
-            h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
-        except TransactionError:
-            # Only a digest that cannot exist for this input. Any other error, such as a
-            # missing utxo or Liquid refusing the opt-in, is the caller's to see.
-            return 0
+        h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
         sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
 
         # check if root is included in the script

@@ -214,6 +214,10 @@ class InputScope(PSBTScope):
         # The prevout index comes off the wire and is not otherwise checked against the
         # transaction it points into. Signing reads every input's spent output, so one
         # crafted sibling would take the whole call down with an IndexError.
+        # A PSBTv2 input can carry the previous transaction without the output index that
+        # selects from it, in which case there is nothing to index with.
+        if self.vout is None:
+            raise PSBTError("Input has a previous transaction but no output index")
         if self.vout >= len(self.non_witness_utxo.vout):
             raise PSBTError("Previous transaction has no output %d" % self.vout)
         return self.non_witness_utxo.vout[self.vout]
@@ -642,15 +646,22 @@ def sighash_types_agree(declared, requested):
     bit off 0x20 leaves zero as well, and that is a different type carrying a message of
     its own, so it must not be folded in.
     """
-    if not (declared & SIGHASH.UNIFIED) and not (requested & SIGHASH.UNIFIED):
-        return declared == requested
-
     def canonical(hash_type):
+        # DEFAULT and ALL are the same request. embit has always treated them so, and the
+        # opt-in cannot ride on DEFAULT, which appends no byte to hold it, so an opted-in
+        # taproot signature names ALL instead.
         if hash_type == SIGHASH.DEFAULT:
             return SIGHASH.ALL
-        return hash_type & ~SIGHASH.UNIFIED
+        return hash_type
 
-    return canonical(declared) == canonical(requested)
+    if not (declared & SIGHASH.UNIFIED) and not (requested & SIGHASH.UNIFIED):
+        # Neither side opts in, so this is embit's own comparison, unchanged.
+        return canonical(declared) == canonical(requested)
+
+    # Only a type that really is DEFAULT means ALL. Stripping the opt-in bit off 0x20
+    # leaves zero as well, and that is a different type carrying a message of its own,
+    # so it must not be folded in.
+    return canonical(declared) & ~SIGHASH.UNIFIED == canonical(requested) & ~SIGHASH.UNIFIED
 
 
 class PSBT(EmbitBase):
@@ -717,6 +728,8 @@ class PSBT(EmbitBase):
             raise PSBTError("Missing previous utxo on input %d" % i)
         if self.inputs[i].witness_utxo:
             return self.inputs[i].witness_utxo
+        if self.inputs[i].vout is None:
+            raise PSBTError("Input %d has a previous transaction but no output index" % i)
         if self.inputs[i].vout >= len(self.inputs[i].non_witness_utxo.vout):
             raise PSBTError(
                 "Previous transaction has no output %d for input %d"
@@ -1130,6 +1143,14 @@ class PSBT(EmbitBase):
                     if derivation.fingerprint == fingerprint:
                         bip32_derivations.add((pub, derivation))
 
+            # SIGHASH_SINGLE commits to the output at this input's index, and there is
+            # none. The digest cannot be built, so this input is skipped as an input this
+            # key cannot sign is, rather than taking the whole call down and discarding
+            # the signatures already made. Checked rather than caught, so it covers the
+            # taproot path too and cannot swallow an unrelated error.
+            if (inp_sighash & 0x1F) == SIGHASH.SINGLE and i >= len(self.tx.vout):
+                continue
+
             # get derived keys for signing
             derived_keypairs = set()  # (prv, pub)
             for pub, derivation in bip32_derivations:
@@ -1173,15 +1194,8 @@ class PSBT(EmbitBase):
                 self._record_sighash_type(inp, inp_sighash, added)
                 continue
 
-            # An input whose digest cannot exist is skipped, as an input this key cannot
-            # sign is, rather than taking down the whole call. SIGHASH_SINGLE with no
-            # output at this index is the reachable case.
-            try:
-                h = self.sighash(i, sighash=inp_sighash)
-            except TransactionError:
-                # Only a digest that cannot exist for this input. Any other error is the
-                # caller's to see.
-                continue
+            # hash can be reused
+            h = self.sighash(i, sighash=inp_sighash)
             sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
 
             # check if root itself is included in the script
