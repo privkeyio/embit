@@ -1,3 +1,15 @@
+# embit, with the unified opt-in signature hash
+
+An unofficial fork of [embit](https://github.com/diybitcoinhardware/embit) carrying the unified opt-in signature hash defined by the Bitcoin hardfork, as Bitcoin Knots `v29.4.1.knots20260508` specifies it in [doc/unified-sighash.md](https://github.com/bitcoinknots/bitcoin/blob/v29.4.1.knots20260508/doc/unified-sighash.md). It is not affiliated with the embit authors, and it is not audited. The MIT licence it inherits disclaims all warranty, and that applies here as much as upstream.
+
+Adds `Transaction.sighash_unified()` and the streaming `PSBTView.sighash_unified()`, hash type negotiation in `sign_with()`, and `SIGHASH.UNIFIED`. Signing that does not set the opt-in bit is byte-identical to upstream. Liquid refuses the bit.
+
+This branch is based on the **v0.8.0** release, which is what downstream builds pin. The same work rebased onto upstream `master` is on `upstream-pr/unified-sighash`.
+
+Everything below the divider is upstream's documentation.
+
+---------------
+
 # embit
 
 A minimal bitcoin library for MicroPython and Python3 with a focus on embedded systems.
