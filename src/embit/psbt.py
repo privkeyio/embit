@@ -1104,29 +1104,35 @@ class PSBT(EmbitBase):
                 inp_sighash, required_sighash
             ):
                 continue
-                # A caller that names a hash type owns the opt-in bit in both
-                # directions, so the PSBT cannot choose the algorithm on its
-                # behalf. An untouched default names nothing, and stripping the
-                # bit there would turn a PSBT that asked for replay protection
-                # into a legacy signature while reporting success. Opting in
-                # only widens what the signature commits to, so honouring the
-                # request is never the unsafe direction; pass SIGHASH.ALL to
-                # refuse it, or sighash=None to defer for every other field too.
+
             # Sign the type the caller asked for, not the one the PSBT declares, so a
             # PSBT cannot choose the algorithm on the caller's behalf. An untouched
-            # default names nothing, and there the PSBT's own type stands.
-            if required_sighash is not None and sighash != SIGHASH.DEFAULT:
+            # default names nothing, and there the PSBT's own type stands: pass
+            # sighash=None to defer to it for every field.
+            #
+            # Confined to the opt-in, which is the only thing the caller is being given
+            # the last word over. Without it this is embit's own behaviour, where a
+            # taproot input declaring DEFAULT and signed with an explicit ALL keeps
+            # DEFAULT and its 64 byte signature.
+            if (
+                required_sighash is not None
+                and sighash != SIGHASH.DEFAULT
+                and (inp_sighash | required_sighash) & SIGHASH.UNIFIED
+            ):
                 inp_sighash = required_sighash
-            # An opted-in taproot signature must name an output type: the bit
-            # cannot ride on SIGHASH_DEFAULT, which appends no byte to hold it.
-            # Bare and segwit v0 read the byte the legacy way, where 0x20 is a
-            # valid hash type carrying a message of its own, so it stays as it is.
+
+            # A bare opt-in names no output type. On taproot the bit cannot ride on
+            # SIGHASH_DEFAULT, which appends no byte to hold it, so 0x20 and 0xA0 are
+            # types the reference refuses there and the input is left unsigned rather
+            # than quietly upgraded to 0x21, which is not what was asked for. Bare and
+            # segwit v0 read the byte the legacy way, where 0x20 is a valid hash type
+            # carrying a message of its own, so it stays as it is.
             if (
                 inp.is_taproot
                 and inp_sighash & SIGHASH.UNIFIED
                 and not inp_sighash & 0x1F
             ):
-                inp_sighash |= SIGHASH.ALL
+                continue
 
             # get all possible derivations with matching fingerprint
             bip32_derivations = set()
@@ -1225,5 +1231,12 @@ class PSBT(EmbitBase):
         opt-in, so signing that does not involve it leaves the field exactly as
         it found it.
         """
-        if added and inp_sighash & SIGHASH.UNIFIED:
+        if not added:
+            return
+        if inp_sighash & SIGHASH.UNIFIED:
+            inp.sighash_type = inp_sighash
+        elif inp.sighash_type is not None and inp.sighash_type & SIGHASH.UNIFIED:
+            # The caller named a plain type over a PSBT that asked for the opt-in, which
+            # it is entitled to do. Leaving the field alone would leave the input
+            # advertising replay protection its signature does not have.
             inp.sighash_type = inp_sighash

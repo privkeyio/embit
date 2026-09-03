@@ -612,14 +612,31 @@ class PSBTView:
             scripts[i] = utxo.script_pubkey
             return values, scripts
 
+        # A value supplied out of band applies to the input being signed and to nothing
+        # else, so where the stream carries a different one for it the siblings below are
+        # still the stream's, and the signatures this view hands back would commit to two
+        # different spent output vectors. At most one of them can verify and nothing tells
+        # the caller which, so refuse rather than produce them.
+        if scope is not None and self.num_inputs > 1:
+            supplied = self._scoped_utxo(i, scope)
+            carried = self.input(i).utxo
+            if carried is not None and carried.serialize() != supplied.serialize():
+                raise PSBTError(
+                    "Input %d was supplied a previous utxo the PSBT contradicts" % i
+                )
+
         # Reading every sibling is O(n) scope skips per input, so signing the whole
-        # transaction walks it O(n^2) times without this.
-        #
+        # transaction walks it O(n^2) times without this. The scopes do not change while
+        # the view is open, and clear_cache drops this with the other digests.
         # The cache holds only what the stream itself carries. A scope supplied out of
         # band belongs to one call and one input, so caching it would hand the caller's
         # value to every later input as a sibling amount, and those signatures would
         # commit to a value the PSBT does not contain. The scoped input is taken from the
         # scope directly and never consults the cache, in either direction.
+        # This retains one TransactionOutput per input, on the order of a few hundred
+        # bytes each, until clear_cache is called. The digest needs every spent output;
+        # re-reading them per input instead would keep this class's usual constant
+        # footprint at the cost of walking the stream n times. ANYONECANPAY never builds it.
         utxos = [
             self._scoped_utxo(i, scope)
             if (scope is not None and idx == i)
@@ -933,16 +950,22 @@ class PSBTView:
             inp_sighash, required_sighash
         ):
             return 0
-            # A caller that names a hash type owns the opt-in bit in both
-            # directions, and an untouched default names nothing, as in
-            # PSBT.sign_with. Pass sighash=None to defer for every field.
-        # Sign the type the caller asked for, as in PSBT.sign_with.
-        if required_sighash is not None and sighash != SIGHASH.DEFAULT:
+
+        # Sign the type the caller asked for, as in PSBT.sign_with. An untouched
+        # default names nothing, and there the PSBT's own type stands. Confined to the
+        # opt-in, so without it this is embit's own behaviour.
+        if (
+            required_sighash is not None
+            and sighash != SIGHASH.DEFAULT
+            and (inp_sighash | required_sighash) & SIGHASH.UNIFIED
+        ):
             inp_sighash = required_sighash
-        # An opted-in taproot signature must name an output type; bare and
-        # segwit v0 read 0x20 as a hash type of its own. As in PSBT.sign_with.
+        # A bare opt-in names no output type, and on taproot the bit cannot ride on
+        # SIGHASH_DEFAULT, so the input is left unsigned rather than upgraded to 0x21.
+        # Bare and segwit v0 read 0x20 as a hash type of its own. As in PSBT.sign_with.
         if inp.is_taproot and inp_sighash & SIGHASH.UNIFIED and not inp_sighash & 0x1F:
-            inp_sighash |= SIGHASH.ALL
+            return 0
+
 
         # SIGHASH_SINGLE commits to the output at this input's index, and there is none.
         # The digest cannot be built, so this input is skipped rather than raising, as in

@@ -227,15 +227,22 @@ class Transaction(EmbitBase):
             self._hash_outputs = h.digest()
         return self._hash_outputs
 
+    # The memo is keyed on what it was computed over, as PSBTView keys its own. Keyed on
+    # nothing it is safe only while every caller passes the same list, and sighash_unified
+    # gave that a second way to break: a caller reusing one Transaction across two calls
+    # with different spent outputs would get the first call's digest for the second, which
+    # signs an amount vector the caller never asked for.
     def hash_amounts(self, amounts):
-        if self._hash_amounts is None:
-            self._hash_amounts = hash_amounts(amounts)
-        return self._hash_amounts
+        key = tuple(amounts)
+        if self._hash_amounts is None or self._hash_amounts[0] != key:
+            self._hash_amounts = (key, hash_amounts(amounts))
+        return self._hash_amounts[1]
 
     def hash_script_pubkeys(self, script_pubkeys):
-        if self._hash_script_pubkeys is None:
-            self._hash_script_pubkeys = hash_script_pubkeys(script_pubkeys)
-        return self._hash_script_pubkeys
+        key = tuple(bytes(s.data) for s in script_pubkeys)
+        if self._hash_script_pubkeys is None or self._hash_script_pubkeys[0] != key:
+            self._hash_script_pubkeys = (key, hash_script_pubkeys(script_pubkeys))
+        return self._hash_script_pubkeys[1]
 
     def sighash_unified(
         self,

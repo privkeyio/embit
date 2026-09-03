@@ -260,8 +260,9 @@ class PSETView(PSBTView):
         # PSBTView.sighash routes the unified opt-in at the Bitcoin digest over Liquid
         # data, where a confidential value is a commitment rather than an int. Reached
         # with default arguments, because PSETView inherits PSBTView.sign_with, whose
-        # default is SIGHASH.DEFAULT rather than PSET's LSIGHASH.ALL. It is a Bitcoin
-        # consensus rule and does not apply to this chain.
+        # default is SIGHASH.DEFAULT rather than PSET's LSIGHASH.ALL, so the bit is
+        # never stripped on the way in. It is a Bitcoin consensus rule and does not
+        # apply to this chain.
         if sighash & SIGHASH.UNIFIED:
             raise PSBTError(
                 "The unified opt-in signature hash is a Bitcoin rule "

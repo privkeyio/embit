@@ -21,6 +21,8 @@ from embit.transaction import (
     TransactionOutput,
 )
 
+ACP = SIGHASH.ANYONECANPAY
+
 ROOT = HDKey.from_string(
     "tprv8ZgxMBicQKsPd9TeAdPADNnSyH9SSUUbTVeFszDE23Ki6TBB5nCefAdHkK8Fm3qMQR6sHwA5"
     "6zqRmKmxnHk37JkiFzvncDqoKmPWubu7hDF"
@@ -67,9 +69,27 @@ def hash_type_bytes(psbt):
     for inp in psbt.inputs:
         for sig in inp.partial_sigs.values():
             out.append(bytes(sig)[-1])
-        for sig in inp.taproot_sigs.values():
+        for sig in taproot_signatures(inp):
             out.append(bytes(sig)[-1] if len(bytes(sig)) == 65 else SIGHASH.DEFAULT)
     return out
+
+
+def taproot_signatures(inp):
+    """Every taproot signature on an input, wherever this class keeps it.
+
+    A script path spend goes to taproot_sigs. A key path spend goes to
+    taproot_key_sig, or straight into the finalized witness where the class has no
+    such field. Reading only one of them makes an assertion about a taproot hash
+    type pass whether or not anything was signed.
+    """
+    sigs = list(inp.taproot_sigs.values())
+    key_sig = getattr(inp, "taproot_key_sig", None)
+    if key_sig is not None:
+        return sigs + [key_sig]
+    witness = getattr(inp, "final_scriptwitness", None)
+    if witness is not None and witness.items:
+        sigs.append(witness.items[0])
+    return sigs
 
 
 class TestSighashTypesAgree(TestCase):
@@ -134,6 +154,136 @@ class TestWhatGetsSigned(TestCase):
         self.assertEqual(hash_type_bytes(psbt), [UNIFIED_ALL])
 
 
+class TestTaprootRefusesABareOptIn(TestCase):
+    """0x20 and 0xA0 name no output type. The bit cannot ride on SIGHASH_DEFAULT,
+    which appends no byte to hold it, so on taproot they are types the reference
+    refuses. Upgrading them to 0x21 signs something other than what was asked for,
+    and did so silently on the one path that skips the agreement check."""
+
+    def test_neither_class_signs_one(self):
+        for declared in (U, U | ACP):
+            for requested in (None, declared):
+                psbt = build([declared], kind="taproot")
+                self.assertEqual(
+                    psbt.sign_with(ROOT, sighash=requested), 0,
+                    f"0x{declared:02x} requested {requested}",
+                )
+                self.assertEqual(psbt.inputs[0].sighash_type, declared)
+
+                view = PSBTView.view(io.BytesIO(build([declared], kind="taproot").serialize()),
+                                     compress=False)
+                self.assertEqual(
+                    view.sign_input(0, ROOT, io.BytesIO(), sighash=requested), 0,
+                    f"view 0x{declared:02x} requested {requested}",
+                )
+
+    def test_segwit_still_signs_one(self):
+        """Bare and segwit v0 read the byte the legacy way, where 0x20 is a valid
+        hash type carrying a message of its own. Refusing there would be wrong."""
+        for declared in (U, U | ACP):
+            psbt = build([declared])
+            self.assertEqual(psbt.sign_with(ROOT, sighash=None), 1)
+            self.assertEqual(hash_type_bytes(psbt), [declared])
+
+    def test_a_sibling_is_still_signed(self):
+        psbt = build([UNIFIED_ALL, U], kind="taproot")
+        self.assertEqual(psbt.sign_with(ROOT, sighash=None), 1)
+        self.assertEqual(hash_type_bytes(psbt), [UNIFIED_ALL])
+
+
+class TestTheOptInIsTheOnlyThingOverridden(TestCase):
+    """Naming a hash type gives the caller the last word over the algorithm, which
+    is what the opt-in bit selects. Reaching further changes embit's own behaviour
+    for callers who never touch the fork."""
+
+    def test_taproot_default_signed_with_an_explicit_all_stays_default(self):
+        psbt = build([SIGHASH.DEFAULT], kind="taproot")
+        self.assertEqual(psbt.sign_with(ROOT, sighash=SIGHASH.ALL), 1)
+        self.assertEqual(len(bytes(taproot_signatures(psbt.inputs[0])[0])), 64)
+        self.assertEqual(hash_type_bytes(psbt), [SIGHASH.DEFAULT])
+
+    def test_the_view_agrees(self):
+        raw = build([SIGHASH.DEFAULT], kind="taproot").serialize()
+        view = PSBTView.view(io.BytesIO(raw), compress=False)
+        out = io.BytesIO()
+        self.assertEqual(view.sign_input(0, ROOT, out, sighash=SIGHASH.ALL), 1)
+
+        psbt = build([SIGHASH.DEFAULT], kind="taproot")
+        psbt.sign_with(ROOT, sighash=SIGHASH.ALL)
+        sig = bytes(taproot_signatures(psbt.inputs[0])[0])
+        self.assertEqual(len(sig), 64)
+        self.assertIn(sig, out.getvalue())
+
+    def test_the_opt_in_is_still_overridden(self):
+        psbt = build([SIGHASH.ALL])
+        self.assertEqual(psbt.sign_with(ROOT, sighash=UNIFIED_ALL), 1)
+        self.assertEqual(hash_type_bytes(psbt), [UNIFIED_ALL])
+
+
+class TestTheFieldAgreesWithTheSignature(TestCase):
+    """A finalizer reads the declared type. An input left advertising the opt-in
+    beside a signature that does not carry it is a disagreement no reader can see
+    through."""
+
+    def test_a_caller_naming_a_plain_type_clears_the_declaration(self):
+        for kind in ("segwit", "taproot"):
+            psbt = build([UNIFIED_ALL], kind=kind)
+            self.assertEqual(psbt.sign_with(ROOT, sighash=SIGHASH.ALL), 1)
+            self.assertEqual(hash_type_bytes(psbt), [SIGHASH.ALL], kind)
+            self.assertEqual(psbt.inputs[0].sighash_type, SIGHASH.ALL, kind)
+
+    def test_signing_that_never_touches_the_opt_in_leaves_the_field_alone(self):
+        psbt = build([None])
+        self.assertEqual(psbt.sign_with(ROOT, sighash=SIGHASH.ALL), 1)
+        self.assertIsNone(psbt.inputs[0].sighash_type)
+
+
+class TestTheDigestMemoIsKeyed(TestCase):
+    """Both classes memoize the hashes over the spent outputs. Keyed on nothing the
+    memo is safe only while every caller passes the same list, and the unified digest
+    is the first thing to take that list as an argument rather than read it off self."""
+
+    def _tx(self):
+        pub, spk, _ = _wallet("taproot")
+        return Transaction(vin=[TransactionInput(bytes(32), 0)],
+                           vout=[TransactionOutput(50000, spk)]), spk
+
+    def test_transaction_recomputes_when_the_amounts_change(self):
+        tx, spk = self._tx()
+        tx.sighash_taproot(0, [spk], [100000])
+        reused = tx.sighash_unified(0, 2, [spk], [999999], sighash=UNIFIED_ALL)
+        fresh, _ = self._tx()
+        self.assertEqual(
+            reused, fresh.sighash_unified(0, 2, [spk], [999999], sighash=UNIFIED_ALL)
+        )
+
+    def test_transaction_recomputes_when_the_scripts_change(self):
+        tx, spk = self._tx()
+        other = _wallet("segwit")[1]
+        tx.sighash_unified(0, 2, [spk], [100000], sighash=UNIFIED_ALL)
+        reused = tx.sighash_unified(0, 2, [other], [100000], sighash=UNIFIED_ALL)
+        fresh, _ = self._tx()
+        self.assertEqual(
+            reused, fresh.sighash_unified(0, 2, [other], [100000], sighash=UNIFIED_ALL)
+        )
+
+    def test_the_view_recomputes_when_the_scripts_change(self):
+        """The amounts half of this was covered; the scripts half was not, so
+        reverting its key broke nothing."""
+        other = _wallet("taproot")[1]
+        raw = build([UNIFIED_ALL], values=[100000]).serialize()
+
+        view = PSBTView.view(io.BytesIO(raw), compress=False)
+        view.sighash(0, sighash=UNIFIED_ALL)
+        scope = view.input(0)
+        scope.witness_utxo = TransactionOutput(100000, other)
+
+        expected = build([UNIFIED_ALL], values=[100000])
+        expected.inputs[0].witness_utxo = TransactionOutput(100000, other)
+        self.assertEqual(view.sighash(0, sighash=UNIFIED_ALL, input_scope=scope),
+                         expected.sighash(0, sighash=UNIFIED_ALL))
+
+
 class TestSighashSingleWithNoOutput(TestCase):
     """SIGHASH_SINGLE commits to the output at the input's index. Where there is
     none the digest cannot be built, so that input is skipped as an unsignable one
@@ -180,6 +330,14 @@ class TestPrevoutIndex(TestCase):
         psbt = self._psbt_with_bad_index(None)
         self.assertRaises(PSBTError, psbt.sighash, 0, sighash=UNIFIED_ALL)
 
+    def test_the_scope_reports_it_too(self):
+        """InputScope.utxo carries its own copy of these checks, and only PSBT.utxo's
+        was reached from here."""
+        for vout in (5, None):
+            inp = self._psbt_with_bad_index(vout).inputs[1]
+            with self.assertRaises(PSBTError):
+                inp.utxo
+
 
 class TestStreamingReaderCache(TestCase):
     """PSBTView caches the spent outputs it reads, because the unified digest needs
@@ -188,38 +346,54 @@ class TestStreamingReaderCache(TestCase):
 
     def test_a_caller_supplied_utxo_does_not_leak_into_siblings(self):
         """Signing one input with a utxo supplied out of band must not hand that
-        value to any other input as its sibling amount."""
-        psbt = build([UNIFIED_ALL, UNIFIED_ALL], values=[100000, 200000])
+        value to any other input as its sibling amount.
+
+        ANYONECANPAY carries only the signed input's spent output, so it is the one
+        message a caller may legitimately build from a value the PSBT contradicts.
+        What the sibling reads afterwards is the whole question here.
+        """
+        psbt = build([UNIFIED_ALL | ACP, UNIFIED_ALL], values=[100000, 200000])
         raw = psbt.serialize()
-        supplied = InputScope()
         pub, spk, _ = _wallet("segwit")
+        supplied = InputScope()
         supplied.witness_utxo = TransactionOutput(999999, spk)
 
         view = PSBTView.view(io.BytesIO(raw), compress=False)
-        view.sign_input(0, ROOT, io.BytesIO(), sighash=UNIFIED_ALL, extra_scope_data=supplied)
+        view.sign_input(0, ROOT, io.BytesIO(), sighash=UNIFIED_ALL | ACP,
+                        extra_scope_data=supplied)
 
         self.assertEqual(view.sighash(1, sighash=UNIFIED_ALL),
                          psbt.sighash(1, sighash=UNIFIED_ALL))
 
-    def test_a_reused_view_still_honours_a_supplied_utxo(self):
-        """The digest memo was keyed on nothing, so the first call's answer came
-        back for every later one."""
+    def test_a_supplied_utxo_the_psbt_contradicts_is_refused(self):
+        """The siblings would still be the stream's, so the two signatures would
+        commit to different spent output vectors and nothing would say which."""
         psbt = build([UNIFIED_ALL, UNIFIED_ALL], values=[100000, 200000])
         raw = psbt.serialize()
         pub, spk, _ = _wallet("segwit")
+        supplied = InputScope()
+        supplied.witness_utxo = TransactionOutput(999999, spk)
 
         view = PSBTView.view(io.BytesIO(raw), compress=False)
-        view.sighash(0, sighash=UNIFIED_ALL)
-        scope = view.input(1)
-        scope.witness_utxo = TransactionOutput(777777, spk)
-        reused = view.sighash(1, sighash=UNIFIED_ALL, input_scope=scope)
+        self.assertRaises(PSBTError, view.sighash, 0, sighash=UNIFIED_ALL,
+                          input_scope=supplied)
+        self.assertRaises(PSBTError, view.sign_input, 0, ROOT, io.BytesIO(),
+                          sighash=UNIFIED_ALL, extra_scope_data=supplied)
 
-        fresh = PSBTView.view(io.BytesIO(raw), compress=False).sighash(
-            1, sighash=UNIFIED_ALL, input_scope=scope
-        )
-        self.assertEqual(reused, fresh)
-        self.assertEqual(reused, build([UNIFIED_ALL, UNIFIED_ALL],
-                                       values=[100000, 777777]).sighash(1, sighash=UNIFIED_ALL))
+    def test_a_reused_view_still_honours_a_supplied_utxo(self):
+        """The digest memo was keyed on nothing, so the first call's answer came
+        back for every later one. One input has no sibling to disagree with, so a
+        caller that knows better than the PSBT is free to say so."""
+        pub, spk, _ = _wallet("segwit")
+        raw = build([UNIFIED_ALL], values=[100000]).serialize()
+        view = PSBTView.view(io.BytesIO(raw), compress=False)
+        self.assertEqual(view.sighash(0, sighash=UNIFIED_ALL),
+                         build([UNIFIED_ALL], values=[100000]).sighash(0, sighash=UNIFIED_ALL))
+
+        scope = view.input(0)
+        scope.witness_utxo = TransactionOutput(777777, spk)
+        self.assertEqual(view.sighash(0, sighash=UNIFIED_ALL, input_scope=scope),
+                         build([UNIFIED_ALL], values=[777777]).sighash(0, sighash=UNIFIED_ALL))
 
     def test_signing_works_when_the_utxo_is_supplied_out_of_band(self):
         """PSBTView exists for signers that know more than the PSBT carries."""
