@@ -21,6 +21,7 @@ from . import script
 from .script import Script, Witness
 from . import hashes
 from .psbt import (
+    sighash_types_agree,
     PSBTError,
     CompressMode,
     InputScope,
@@ -30,6 +31,7 @@ from .psbt import (
     skip_string,
 )
 from .transaction import (
+    TransactionError,
     TransactionOutput,
     TransactionInput,
     SIGHASH,
@@ -205,6 +207,7 @@ class PSBTView:
         self._hash_outputs = None
         self._hash_amounts = None
         self._hash_script_pubkeys = None
+        self._spent_outputs_cache = None
 
     @classmethod
     def view(cls, stream, offset=None, compress=CompressMode.KEEP_ALL):
@@ -587,7 +590,7 @@ class PSBTView:
         h.update(sighash.to_bytes(4, "little"))
         return hashlib.sha256(h.digest()).digest()
 
-    def _spent_outputs(self, i, anyonecanpay):
+    def _spent_outputs(self, i, anyonecanpay, scope=None):
         """Values and scriptPubKeys of every spent output, in input order.
 
         Under ANYONECANPAY the message carries only this input's spent output,
@@ -598,21 +601,30 @@ class PSBTView:
         if anyonecanpay:
             values = [0] * self.num_inputs
             scripts = [Script(b"")] * self.num_inputs
-            utxo = self.input(i).utxo
-            if utxo is None:
-                raise PSBTError("Missing previous utxo on input %d" % i)
+            utxo = self._utxo(i, i, scope)
             values[i] = utxo.value
             scripts[i] = utxo.script_pubkey
             return values, scripts
-        values = []
-        scripts = []
-        for idx in range(self.num_inputs):
-            utxo = self.input(idx).utxo
-            if utxo is None:
-                raise PSBTError("Missing previous utxo on input %d" % idx)
-            values.append(utxo.value)
-            scripts.append(utxo.script_pubkey)
-        return values, scripts
+
+        # Reading every sibling is O(n) scope skips per input, so signing the whole
+        # transaction walks it O(n^2) times without this. The scopes do not change while
+        # the view is open, and clear_cache drops this with the other digests.
+        if self._spent_outputs_cache is None:
+            self._spent_outputs_cache = [
+                self._utxo(idx, i, scope) for idx in range(self.num_inputs)
+            ]
+        utxos = list(self._spent_outputs_cache)
+        # The caller may have supplied this input's scope out of band
+        utxos[i] = self._utxo(i, i, scope)
+        return [u.value for u in utxos], [u.script_pubkey for u in utxos]
+
+    def _utxo(self, idx, signing_index, scope=None):
+        """The spent output of one input, taking a scope supplied out of band for it."""
+        inp = scope if (scope is not None and idx == signing_index) else self.input(idx)
+        utxo = inp.utxo
+        if utxo is None:
+            raise PSBTError("Missing previous utxo on input %d" % idx)
+        return utxo
 
     def sighash_unified(
         self,
@@ -687,7 +699,7 @@ class PSBTView:
         # The single output, where BIP341 puts it.
         if sh == SIGHASH.SINGLE:
             if input_index >= self.num_outputs:
-                raise PSBTError("SIGHASH_SINGLE with no matching output")
+                raise TransactionError("SIGHASH_SINGLE with no matching output")
             h.update(hashlib.sha256(self.vout(input_index).serialize()).digest())
 
         if script_type == 3:
@@ -707,7 +719,9 @@ class PSBTView:
         # the opt-in bit rather than by the input's kind. Kept in step with
         # PSBT.sighash; a signer must not get a different digest here.
         if sighash & SIGHASH.UNIFIED:
-            values, scripts = self._spent_outputs(i, sighash & SIGHASH.ANYONECANPAY)
+            values, scripts = self._spent_outputs(
+                i, sighash & SIGHASH.ANYONECANPAY, input_scope
+            )
             leaf_script = kwargs.pop("script", None)
             leaf_version = kwargs.pop("leaf_version", 0xC0)
             kwargs.pop("ext_flag", None)
@@ -894,22 +908,16 @@ class PSBTView:
         # if input sighash is set and is different from required sighash
         # we don't sign this input
         # except DEFAULT is functionally the same as ALL
-        if required_sighash is not None and inp_sighash != required_sighash:
-            if (inp_sighash & ~SIGHASH.UNIFIED) not in {
-                SIGHASH.DEFAULT,
-                SIGHASH.ALL,
-            } or (required_sighash & ~SIGHASH.UNIFIED) not in {
-                SIGHASH.DEFAULT,
-                SIGHASH.ALL,
-            }:
-                return 0
+        if required_sighash is not None and not sighash_types_agree(
+            inp_sighash, required_sighash
+        ):
+            return 0
             # A caller that names a hash type owns the opt-in bit in both
             # directions, and an untouched default names nothing, as in
             # PSBT.sign_with. Pass sighash=None to defer for every field.
-            if sighash != SIGHASH.DEFAULT:
-                inp_sighash = (inp_sighash & ~SIGHASH.UNIFIED) | (
-                    required_sighash & SIGHASH.UNIFIED
-                )
+        # Sign the type the caller asked for, as in PSBT.sign_with.
+        if required_sighash is not None and sighash != SIGHASH.DEFAULT:
+            inp_sighash = required_sighash
         # An opted-in taproot signature must name an output type; bare and
         # segwit v0 read 0x20 as a hash type of its own. As in PSBT.sign_with.
         if inp.is_taproot and inp_sighash & SIGHASH.UNIFIED and not inp_sighash & 0x1F:
@@ -977,7 +985,12 @@ class PSBTView:
                 ser_string(sig_stream, inp.taproot_sigs[(pub, leaf)])
             return counter
 
-        h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
+        try:
+            h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
+        except TransactionError:
+            # Only a digest that cannot exist for this input. Any other error, such as a
+            # missing utxo or Liquid refusing the opt-in, is the caller's to see.
+            return 0
         sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
 
         # check if root is included in the script

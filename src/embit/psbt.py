@@ -1,5 +1,12 @@
 from collections import OrderedDict
-from .transaction import Transaction, TransactionOutput, TransactionInput, SIGHASH, UNIFIED_SCRIPT_TYPE
+from .transaction import (
+    Transaction,
+    TransactionOutput,
+    TransactionInput,
+    TransactionError,
+    SIGHASH,
+    UNIFIED_SCRIPT_TYPE,
+)
 from . import compact
 from . import bip32
 from . import ec
@@ -200,13 +207,16 @@ class InputScope(PSBTScope):
 
     @property
     def utxo(self):
-        return (
-            self._utxo
-            or self.witness_utxo
-            or (
-                self.non_witness_utxo.vout[self.vout] if self.non_witness_utxo else None
-            )
-        )
+        if self._utxo or self.witness_utxo:
+            return self._utxo or self.witness_utxo
+        if self.non_witness_utxo is None:
+            return None
+        # The prevout index comes off the wire and is not otherwise checked against the
+        # transaction it points into. Signing reads every input's spent output, so one
+        # crafted sibling would take the whole call down with an IndexError.
+        if self.vout >= len(self.non_witness_utxo.vout):
+            raise PSBTError("Previous transaction has no output %d" % self.vout)
+        return self.non_witness_utxo.vout[self.vout]
 
     @property
     def script_pubkey(self):
@@ -619,6 +629,30 @@ class OutputScope(PSBTScope):
         return r
 
 
+def sighash_types_agree(declared, requested):
+    """Whether a PSBT's declared hash type is the one being asked for.
+
+    Ported from SighashTypesAgree in the reference implementation. The opt-in bit names
+    which algorithm signs, not what the signature covers, so a caller may opt in over a
+    PSBT declaring plain ALL, which is what every wallet predating this writes.
+
+    SIGHASH_DEFAULT and SIGHASH_ALL mean the same thing here, because the bit cannot ride
+    on DEFAULT: it appends no byte to hold it, so an opted-in taproot signature names ALL
+    instead. Only a type that really is DEFAULT means ALL, though. Stripping the opt-in
+    bit off 0x20 leaves zero as well, and that is a different type carrying a message of
+    its own, so it must not be folded in.
+    """
+    if not (declared & SIGHASH.UNIFIED) and not (requested & SIGHASH.UNIFIED):
+        return declared == requested
+
+    def canonical(hash_type):
+        if hash_type == SIGHASH.DEFAULT:
+            return SIGHASH.ALL
+        return hash_type & ~SIGHASH.UNIFIED
+
+    return canonical(declared) == canonical(requested)
+
+
 class PSBT(EmbitBase):
     MAGIC = b"psbt\xff"
     # for subclasses
@@ -681,10 +715,14 @@ class PSBT(EmbitBase):
             return self.inputs[i].utxo
         if not (self.inputs[i].witness_utxo or self.inputs[i].non_witness_utxo):
             raise PSBTError("Missing previous utxo on input %d" % i)
-        return (
-            self.inputs[i].witness_utxo
-            or self.inputs[i].non_witness_utxo.vout[self.inputs[i].vout]
-        )
+        if self.inputs[i].witness_utxo:
+            return self.inputs[i].witness_utxo
+        if self.inputs[i].vout >= len(self.inputs[i].non_witness_utxo.vout):
+            raise PSBTError(
+                "Previous transaction has no output %d for input %d"
+                % (self.inputs[i].vout, i)
+            )
+        return self.inputs[i].non_witness_utxo.vout[self.inputs[i].vout]
 
     def fee(self):
         fee = sum([self.utxo(i).value for i in range(len(self.inputs))])
@@ -1049,15 +1087,10 @@ class PSBT(EmbitBase):
             # PSBT that declares plain ALL, which is what every wallet predating
             # the fork writes. Without this the caller's request is dropped and
             # the signature carries no replay protection.
-            if required_sighash is not None and inp_sighash != required_sighash:
-                if (inp_sighash & ~SIGHASH.UNIFIED) not in {
-                    SIGHASH.DEFAULT,
-                    SIGHASH.ALL,
-                } or (required_sighash & ~SIGHASH.UNIFIED) not in {
-                    SIGHASH.DEFAULT,
-                    SIGHASH.ALL,
-                }:
-                    continue
+            if required_sighash is not None and not sighash_types_agree(
+                inp_sighash, required_sighash
+            ):
+                continue
                 # A caller that names a hash type owns the opt-in bit in both
                 # directions, so the PSBT cannot choose the algorithm on its
                 # behalf. An untouched default names nothing, and stripping the
@@ -1066,10 +1099,11 @@ class PSBT(EmbitBase):
                 # only widens what the signature commits to, so honouring the
                 # request is never the unsafe direction; pass SIGHASH.ALL to
                 # refuse it, or sighash=None to defer for every other field too.
-                if sighash != SIGHASH.DEFAULT:
-                    inp_sighash = (inp_sighash & ~SIGHASH.UNIFIED) | (
-                        required_sighash & SIGHASH.UNIFIED
-                    )
+            # Sign the type the caller asked for, not the one the PSBT declares, so a
+            # PSBT cannot choose the algorithm on the caller's behalf. An untouched
+            # default names nothing, and there the PSBT's own type stands.
+            if required_sighash is not None and sighash != SIGHASH.DEFAULT:
+                inp_sighash = required_sighash
             # An opted-in taproot signature must name an output type: the bit
             # cannot ride on SIGHASH_DEFAULT, which appends no byte to hold it.
             # Bare and segwit v0 read the byte the legacy way, where 0x20 is a
@@ -1139,8 +1173,15 @@ class PSBT(EmbitBase):
                 self._record_sighash_type(inp, inp_sighash, added)
                 continue
 
-            # hash can be reused
-            h = self.sighash(i, sighash=inp_sighash)
+            # An input whose digest cannot exist is skipped, as an input this key cannot
+            # sign is, rather than taking down the whole call. SIGHASH_SINGLE with no
+            # output at this index is the reachable case.
+            try:
+                h = self.sighash(i, sighash=inp_sighash)
+            except TransactionError:
+                # Only a digest that cannot exist for this input. Any other error is the
+                # caller's to see.
+                continue
             sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
 
             # check if root itself is included in the script
