@@ -966,12 +966,14 @@ class PSBTView:
         if inp.is_taproot and inp_sighash & SIGHASH.UNIFIED and not inp_sighash & 0x1F:
             return 0
 
-
         # SIGHASH_SINGLE commits to the output at this input's index, and there is none.
-        # The digest cannot be built, so this input is skipped rather than raising, as in
-        # PSBT.sign_with. Checked rather than caught, so it covers taproot too and cannot
-        # swallow an unrelated error.
-        if (inp_sighash & 0x1F) == SIGHASH.SINGLE and i >= self.num_outputs:
+        # The unified digest cannot be built, so this input is skipped rather than
+        # raising, as in PSBT.sign_with. Confined to the opt-in for the same reason.
+        if (
+            inp_sighash & SIGHASH.UNIFIED
+            and (inp_sighash & 0x1F) == SIGHASH.SINGLE
+            and i >= self.num_outputs
+        ):
             return 0
 
         # get all possible derivations with matching fingerprint

@@ -306,6 +306,22 @@ class TestSighashSingleWithNoOutput(TestCase):
         psbt = build([SIGHASH.ALL, 0x05])
         self.assertRaises(TransactionError, psbt.sign_with, ROOT, sighash=None)
 
+    def test_the_legacy_digests_are_left_to_answer_it_themselves(self):
+        """Without the opt-in this is not the unified message's problem. Segwit v0
+        signs it, and skipping there would change behaviour for callers who never
+        touch the fork."""
+        psbt = build([SIGHASH.SINGLE], nout=0)
+        self.assertEqual(psbt.sign_with(ROOT, sighash=None), 1)
+        self.assertEqual(hash_type_bytes(psbt), [SIGHASH.SINGLE])
+
+        raw = build([SIGHASH.SINGLE], nout=0).serialize()
+        view = PSBTView.view(io.BytesIO(raw), compress=False)
+        self.assertEqual(view.sign_with(ROOT, io.BytesIO(), sighash=None), 1)
+
+    def test_the_opt_in_is_still_skipped(self):
+        psbt = build([U | SIGHASH.SINGLE], nout=0)
+        self.assertEqual(psbt.sign_with(ROOT, sighash=None), 0)
+
 
 class TestPrevoutIndex(TestCase):
     """The index selecting from the previous transaction comes off the wire."""

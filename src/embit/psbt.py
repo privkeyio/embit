@@ -655,7 +655,9 @@ def sighash_types_agree(declared, requested):
         return hash_type
 
     if not (declared & SIGHASH.UNIFIED) and not (requested & SIGHASH.UNIFIED):
-        # Neither side opts in, so this is embit's own comparison, unchanged.
+        # Neither side opts in, so this is embit's own comparison, unchanged. Stated
+        # rather than relied on: with no opt-in bit to strip, the comparison below
+        # already reduces to this one for all 65536 pairs.
         return canonical(declared) == canonical(requested)
 
     # Only a type that really is DEFAULT means ALL. Stripping the opt-in bit off 0x20
@@ -1150,11 +1152,18 @@ class PSBT(EmbitBase):
                         bip32_derivations.add((pub, derivation))
 
             # SIGHASH_SINGLE commits to the output at this input's index, and there is
-            # none. The digest cannot be built, so this input is skipped as an input this
-            # key cannot sign is, rather than taking the whole call down and discarding
-            # the signatures already made. Checked rather than caught, so it covers the
-            # taproot path too and cannot swallow an unrelated error.
-            if (inp_sighash & 0x1F) == SIGHASH.SINGLE and i >= len(self.tx.vout):
+            # none. The unified digest cannot be built, so this input is skipped as an
+            # input this key cannot sign is, rather than taking the whole call down and
+            # discarding the signatures already made. Checked rather than caught, so it
+            # covers the taproot path too and cannot swallow an unrelated error.
+            #
+            # Confined to the opt-in: without it the legacy digests answer this their own
+            # way, which is embit's behaviour to keep, not this feature's to change.
+            if (
+                inp_sighash & SIGHASH.UNIFIED
+                and (inp_sighash & 0x1F) == SIGHASH.SINGLE
+                and i >= len(self.tx.vout)
+            ):
                 continue
 
             # get derived keys for signing
