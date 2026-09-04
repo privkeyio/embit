@@ -528,3 +528,74 @@ class TestClassesAgree(TestCase):
                                 view.sighash(i, sighash=declared),
                                 f"{kind} n={n} nout={nout} 0x{declared:02x} input {i}",
                             )
+
+
+class TestScriptTypeComesFromTheScript(TestCase):
+    """The committed script type byte is domain separation, so it has to describe the
+    spent output itself.
+
+    BIP174 lets a legacy input be carried as witness_utxo, and this classified from
+    which fields were present rather than from the script. The same P2PKH output then
+    committed WITNESS_V0 through one carrier and BARE through the other, so one of the
+    two signatures could not verify, and two signers handed different carriers of one
+    PSBT disagreed with each other.
+    """
+
+    def _legacy_input(self, carrier):
+        pub = ROOT.derive("m/44h/1h/0h/0/0").to_public()
+        spk = script.p2pkh(pub)
+        self.assertEqual("p2pkh", spk.script_type())
+        prev = Transaction(
+            vin=[TransactionInput(bytes(32), 0)],
+            vout=[TransactionOutput(100000, spk)],
+        )
+        psbt = PSBT(
+            Transaction(
+                vin=[TransactionInput(prev.txid(), 0)],
+                vout=[TransactionOutput(90000, spk)],
+            )
+        )
+        inp = psbt.inputs[0]
+        if carrier == "witness_utxo":
+            inp.witness_utxo = TransactionOutput(100000, spk)
+        else:
+            inp.non_witness_utxo = prev
+        inp.sighash_type = UNIFIED_ALL
+        return psbt
+
+    def test_the_carrier_does_not_change_the_digest(self):
+        by_tx = self._legacy_input("non_witness_utxo")
+        by_output = self._legacy_input("witness_utxo")
+        self.assertEqual(
+            by_tx.sighash(0, sighash=UNIFIED_ALL),
+            by_output.sighash(0, sighash=UNIFIED_ALL),
+        )
+
+    def test_the_streaming_reader_agrees_through_either_carrier(self):
+        for carrier in ("non_witness_utxo", "witness_utxo"):
+            psbt = self._legacy_input(carrier)
+            view = PSBTView.view(io.BytesIO(psbt.serialize()), compress=False)
+            self.assertEqual(
+                psbt.sighash(0, sighash=UNIFIED_ALL),
+                view.sighash(0, sighash=UNIFIED_ALL),
+                carrier,
+            )
+
+    def test_wrapped_segwit_is_still_witness_v0(self):
+        """The redeem script still decides, so P2SH-P2WPKH must not fall back to BARE."""
+        pub = ROOT.derive("m/49h/1h/0h/0/0").to_public()
+        redeem = script.p2wpkh(pub)
+        spk = script.p2sh(redeem)
+        native = PSBT(
+            Transaction(
+                vin=[TransactionInput(bytes(32), 0)],
+                vout=[TransactionOutput(90000, spk)],
+            )
+        )
+        native.inputs[0].witness_utxo = TransactionOutput(100000, spk)
+        native.inputs[0].redeem_script = redeem
+        native.inputs[0].sighash_type = UNIFIED_ALL
+        wrapped_digest = native.sighash(0, sighash=UNIFIED_ALL)
+
+        bare = self._legacy_input("witness_utxo")
+        self.assertNotEqual(wrapped_digest, bare.sighash(0, sighash=UNIFIED_ALL))

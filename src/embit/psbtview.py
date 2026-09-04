@@ -824,10 +824,14 @@ class PSBTView:
                     i, UNIFIED_SCRIPT_TYPE.TAPROOT, sighash, **spent, **kwargs
                 )
             sc = inp.witness_script or inp.redeem_script or inp.utxo.script_pubkey
+            # Classified from the spent output's own script, never from which PSBT
+            # fields happen to be present. BIP174 allows a legacy input to be carried
+            # as witness_utxo, and reading presence would commit WITNESS_V0 for it,
+            # which consensus can only accept as BARE. The byte is domain separation:
+            # getting it wrong produces a signature that fails on chain, and two
+            # signers handed different carriers of one UTXO would disagree.
             is_segwit = (
-                inp.witness_script
-                or inp.witness_utxo
-                or inp.utxo.script_pubkey.script_type() in {"p2wpkh", "p2wsh"}
+                inp.utxo.script_pubkey.script_type() in {"p2wpkh", "p2wsh"}
                 or (
                     inp.redeem_script
                     and inp.redeem_script.script_type() in {"p2wpkh", "p2wsh"}
